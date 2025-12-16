@@ -1,27 +1,40 @@
-require('dotenv').config(); // Подключаем .env
+require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
 const mongoose = require('mongoose');
+const http = require('http');
 
 // ==========================================
-// ⚙️ НАСТРОЙКИ ИЗ .ENV
+// 1️⃣ СЕРВЕР ДЛЯ RENDER (Health Check)
+// ==========================================
+// Этого блока НЕ БЫЛО в твоем старом коде, но он ОБЯЗАТЕЛЕН для Render.
+const server = http.createServer((req, res) => {
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'text/plain');
+    res.end('Telegram Bot is Active! 🚀');
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`✅ Web Server started on port ${PORT}`);
+});
+
+// ==========================================
+// 2️⃣ НАСТРОЙКИ
 // ==========================================
 const token = process.env.BOT_TOKEN;
 const MONGO_URI = process.env.MONGO_URI;
-// Преобразуем ID админа в число, так как Telegram отдает chatId числом
-const ADMIN_ID = parseInt(process.env.ADMIN_ID); 
+const ADMIN_ID = parseInt(process.env.ADMIN_ID);
 const PARTNER_LINK = process.env.PARTNER_LINK;
 
 if (!token || !MONGO_URI || !ADMIN_ID) {
-    console.error('❌ ОШИБКА: Не заполнен файл .env');
-    process.exit(1);
+    console.error('❌ ОШИБКА: Проверь .env файл (BOT_TOKEN, MONGO_URI, ADMIN_ID)');
 }
 
 // Подключение к БД
 mongoose.connect(MONGO_URI)
     .then(() => console.log('✅ MongoDB подключена'))
-    .catch(err => console.error('❌ Ошибка подключения БД:', err));
+    .catch(err => console.error('❌ Ошибка БД:', err));
 
-// Схема пользователя
 const userSchema = new mongoose.Schema({
     chatId: { type: Number, unique: true },
     username: String,
@@ -33,148 +46,107 @@ const userSchema = new mongoose.Schema({
 const User = mongoose.model('User', userSchema);
 const bot = new TelegramBot(token, { polling: true });
 
-// Состояние админа
 let adminState = { step: null };
 
 // ==========================================
-// 🛠 НАСТРОЙКА КНОПКИ "МЕНЮ" (COMMANDS)
+// 3️⃣ НАСТРОЙКА МЕНЮ
 // ==========================================
-
 async function setupCommands() {
     try {
-        // 1. Меню для ВСЕХ пользователей
-        const userCommands = [
-            { command: '/start', description: '🏠 Перезапуск / Меню' },
-            { command: '/bonus', description: '🎁 Забрать бонус 1win' },
+        // Меню для всех
+        await bot.setMyCommands([
+            { command: '/start', description: '🏠 Главная' },
+            { command: '/bonus', description: '🎁 Бонус' },
             { command: '/about', description: 'ℹ️ О боте' }
-        ];
+        ]);
+        
+        // Меню для АДМИНА
+        await bot.setMyCommands([
+            { command: '/start', description: '🏠 Главная' },
+            { command: '/send', description: '📢 Рассылка' },
+            { command: '/stats', description: '📊 Статистика' },
+            { command: '/cancel', description: '❌ Отмена' }
+        ], { scope: { type: 'chat', chat_id: ADMIN_ID } });
 
-        // Устанавливаем дефолтное меню
-        await bot.setMyCommands(userCommands);
-
-        // 2. Меню ЛИЧНО ДЛЯ АДМИНА (по твоему ID)
-        // Добавляем сюда секретные команды
-        const adminCommands = [
-            { command: '/start', description: '🏠 Перезапуск' },
-            { command: '/send', description: '📢 Создать рассылку' },
-            { command: '/stats', description: '📊 Статистика юзеров' }, // Новая команда
-            { command: '/cancel', description: '❌ Отменить действие' }
-        ];
-
-        // scope: { type: 'chat', chat_id: ADMIN_ID } — магия, которая показывает это только тебе
-        await bot.setMyCommands(adminCommands, { 
-            scope: { type: 'chat', chat_id: ADMIN_ID } 
-        });
-
-        console.log('✅ Командное меню настроено (Admin vs User)');
+        console.log('✅ Меню обновлено');
     } catch (error) {
-        console.error('Ошибка настройки меню:', error);
+        console.error('Ошибка меню:', error.message);
     }
 }
-
-// Вызываем функцию настройки меню при старте
 setupCommands();
 
 // ==========================================
-// 1️⃣ ЛОГИКА АДМИНА (РАССЫЛКА)
+// 4️⃣ ЛОГИКА АДМИНА (Рассылка)
 // ==========================================
 
-// Команда /send
+bot.onText(/\/stats/, async (msg) => {
+    if (msg.chat.id !== ADMIN_ID) return;
+    const total = await User.countDocuments();
+    const blocked = await User.countDocuments({ isBlocked: true });
+    bot.sendMessage(ADMIN_ID, `📊 <b>Статистика:</b>\n👥 Всего юзеров: ${total}\n💀 Блок: ${blocked}`, { parse_mode: 'HTML' });
+});
+
 bot.onText(/\/send/, (msg) => {
     if (msg.chat.id !== ADMIN_ID) return;
     adminState.step = 'WAITING_POST';
-    bot.sendMessage(ADMIN_ID, '📢 <b>Режим рассылки</b>\n\nПерешли мне пост или напиши текст. Я отправлю его всем.', { parse_mode: 'HTML' });
+    bot.sendMessage(ADMIN_ID, '📢 <b>Режим рассылки</b>\nПерешли пост или напиши текст:', { parse_mode: 'HTML' });
 });
 
-// Команда /cancel
 bot.onText(/\/cancel/, (msg) => {
     if (msg.chat.id !== ADMIN_ID) return;
     adminState.step = null;
-    bot.sendMessage(ADMIN_ID, '❌ Рассылка отменена.');
+    bot.sendMessage(ADMIN_ID, '❌ Отмена.');
 });
 
-// ГЛАВНЫЙ ОБРАБОТЧИК СООБЩЕНИЙ
+// ГЛАВНЫЙ ОБРАБОТЧИК (И Рассылка, и Сохранение юзеров)
 bot.on('message', async (msg) => {
     const chatId = msg.chat.id;
     
-    // Игнорируем команды, чтобы они не попадали в рассылку или базу как обычный текст
-    // (если сообщение начинается со слэша, мы выходим из этой функции, так как сработает onText)
+    // Не реагируем на команды как на текст
     if (msg.text && msg.text.startsWith('/')) return;
 
-    // --- БЛОК АДМИНА (РАССЫЛКА) ---
+    // --- ЛОГИКА РАССЫЛКИ ---
     if (chatId === ADMIN_ID && adminState.step === 'WAITING_POST') {
         const users = await User.find({ isBlocked: false });
-        
-        if (users.length === 0) {
-            bot.sendMessage(ADMIN_ID, '🤷‍♂️ В базе пока нет пользователей.');
-            adminState.step = null;
-            return;
-        }
+        bot.sendMessage(ADMIN_ID, `⏳ Рассылаю на ${users.length} чел...`);
+        adminState.step = null;
 
-        bot.sendMessage(ADMIN_ID, `⏳ Начинаю рассылку на ${users.length} юзеров...`);
-        adminState.step = null; // Сбрасываем режим, чтобы не зациклило
-
-        let success = 0;
-        let blocked = 0;
-
+        let count = 0;
         for (const user of users) {
             try {
-                // Копируем сообщение (текст, фото, видео, кружочки)
                 await bot.copyMessage(user.chatId, ADMIN_ID, msg.message_id);
-                success++;
-            } catch (error) {
-                // Ошибка 403 - юзер заблочил бота
-                if (error.response && error.response.statusCode === 403) {
-                    blocked++;
+                count++;
+            } catch (e) {
+                if (e.response && e.response.statusCode === 403) {
                     await User.updateOne({ chatId: user.chatId }, { isBlocked: true });
-                } else {
-                    console.error(`Ошибка отправки юзеру ${user.chatId}:`, error.message);
                 }
             }
-            // Задержка 50мс (20 сообщений в секунду - лимит Телеграм)
-            await new Promise(resolve => setTimeout(resolve, 50));
+            await new Promise(r => setTimeout(r, 50)); // Пауза от спама
         }
-
-        return bot.sendMessage(ADMIN_ID, 
-            `✅ <b>Рассылка завершена!</b>\n\n` +
-            `📨 Доставлено: ${success}\n` +
-            `💀 Бот заблокирован: ${blocked}`, 
-            { parse_mode: 'HTML' }
-        );
+        return bot.sendMessage(ADMIN_ID, `✅ Рассылка завершена! Доставлено: ${count}`);
     }
 
-    // --- БЛОК ОБЫЧНОГО ПОЛЬЗОВАТЕЛЯ ---
-    // Сохраняем всех, кто пишет (даже если это админ, пусть будет в базе для тестов)
+    // --- ЛОГИКА СОХРАНЕНИЯ ЮЗЕРА ---
+    // (Сохраняем любого, кто пишет боту, чтобы потом делать рассылку)
     try {
         await User.updateOne(
-            { chatId: chatId }, 
-            { 
-                $setOnInsert: { 
-                    username: msg.from.username, 
-                    firstName: msg.from.first_name 
-                },
-                isBlocked: false 
-            }, 
+            { chatId }, 
+            { $setOnInsert: { username: msg.from.username, firstName: msg.from.first_name }, isBlocked: false }, 
             { upsert: true }
         );
-    } catch (e) {
-        console.error('Ошибка записи в БД:', e);
-    }
+    } catch (e) { console.error(e); }
 });
 
 // ==========================================
-// 2️⃣ ЛОГИКА ВОРОНКИ (START)
+// 5️⃣ ВОРОНКА (START FLOW)
 // ==========================================
 
-bot.onText(/\/start/, (msg) => {
+bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
-    // При старте тоже обновляем/добавляем юзера в базу
-    User.updateOne({ chatId }, { isBlocked: false, firstName: msg.from.first_name }, { upsert: true }).exec();
+    await User.updateOne({ chatId }, { isBlocked: false, firstName: msg.from.first_name }, { upsert: true });
 
     bot.sendMessage(chatId, 
-        `👋 <b>Привет!</b>\n\n` +
-        `Получи доступ к VIP-сигналам 1win и бонусу.\n` +
-        `Сначала ответь: Ты из какой страны?`, 
+        `👋 <b>Привет!</b>\n\nЗдесь ты получишь доступ к приватному каналу с сигналами и бонусом.\n👇 Выбери страну:`, 
         {
             parse_mode: 'HTML',
             reply_markup: {
@@ -197,10 +169,7 @@ bot.on('callback_query', async (query) => {
                 chat_id: chatId,
                 message_id: query.message.message_id,
                 reply_markup: {
-                    inline_keyboard: [
-                        [{ text: '✅ Да', callback_data: 'age_yes' }],
-                        [{ text: '❌ Нет', callback_data: 'age_no' }]
-                    ]
+                    inline_keyboard: [[{ text: '✅ Да', callback_data: 'age_yes' }], [{ text: '❌ Нет', callback_data: 'age_no' }]]
                 }
             });
         }
@@ -209,68 +178,33 @@ bot.on('callback_query', async (query) => {
                 chat_id: chatId,
                 message_id: query.message.message_id,
                 reply_markup: {
-                    inline_keyboard: [
-                        [{ text: 'Да, был', callback_data: 'acc_yes' }],
-                        [{ text: 'Нет, новый', callback_data: 'acc_no' }]
-                    ]
+                    inline_keyboard: [[{ text: 'Да, был', callback_data: 'acc_yes' }], [{ text: 'Нет, новый', callback_data: 'acc_no' }]]
                 }
             });
-        } 
+        }
         else if (data === 'age_no') {
-            await bot.sendMessage(chatId, '❌ Доступ только с 18 лет.');
+            await bot.sendMessage(chatId, '⛔ Доступ только с 18 лет.');
         }
         else if (data === 'acc_yes') {
-            await bot.sendMessage(chatId, '⚠️ Бонус доступен только для новых игроков. Зарегистрируй новый аккаунт, чтобы получать сигналы.');
-            sendFinalLink(chatId);
-        } 
-        else if (data === 'acc_no') {
-            await bot.sendMessage(chatId, '✅ Отлично! Аккаунт подходит для сигналов.');
+            await bot.sendMessage(chatId, '⚠️ Бонус работает только на НОВЫХ аккаунтах. Зарегистрируй новый!');
             sendFinalLink(chatId);
         }
-    } catch (error) {
-        console.error('Ошибка в кнопках:', error);
-    }
+        else if (data === 'acc_no') {
+            await bot.sendMessage(chatId, '✅ Отлично! Аккаунт подходит.');
+            sendFinalLink(chatId);
+        }
+    } catch (e) { console.error(e); }
 });
 
 function sendFinalLink(chatId) {
     bot.sendMessage(chatId, 
-        `🎁 <b>Твой доступ готов!</b>\n\n` +
-        `1. Регистрируйся: <a href="${PARTNER_LINK}">ПЕРЕЙТИ В 1WIN</a>\n` +
-        `2. Жди уведомлений о матчах в этом боте.`,
-        { 
-            parse_mode: 'HTML',
-            disable_web_page_preview: true
-        }
+        `🎁 <b>Твой доступ готов!</b>\n\n1. Регистрируйся: <a href="${PARTNER_LINK}">ПЕРЕЙТИ В 1WIN</a>\n2. Жди сигналы здесь.`,
+        { parse_mode: 'HTML', disable_web_page_preview: true }
     );
 }
 
-// Обработчик кнопки "О боте"
-bot.onText(/\/about/, (msg) => {
-    bot.sendMessage(msg.chat.id, '🤖 Это официальный бот с сигналами. Мы используем AI для прогнозирования матчей.');
-});
+// Доп. кнопки
+bot.onText(/\/bonus/, (msg) => sendFinalLink(msg.chat.id));
+bot.onText(/\/about/, (msg) => bot.sendMessage(msg.chat.id, '🤖 Бот работает на базе AI.'));
 
-// Обработчик кнопки "Бонус"
-bot.onText(/\/bonus/, (msg) => {
-    // Можно просто переслать на ту же логику, что и в конце воронки
-    sendFinalLink(msg.chat.id);
-});
-
-// Обработчик статистики (ТОЛЬКО ДЛЯ АДМИНА)
-bot.onText(/\/stats/, async (msg) => {
-    if (msg.chat.id !== ADMIN_ID) return;
-
-    // Считаем людей в базе
-    const totalUsers = await User.countDocuments();
-    const activeUsers = await User.countDocuments({ isBlocked: false });
-    const blockedUsers = await User.countDocuments({ isBlocked: true });
-
-    bot.sendMessage(ADMIN_ID, 
-        `📊 <b>Статистика бота:</b>\n\n` +
-        `👥 Всего в базе: <b>${totalUsers}</b>\n` +
-        `✅ Активные: <b>${activeUsers}</b>\n` +
-        `💀 Заблокировали: <b>${blockedUsers}</b>`,
-        { parse_mode: 'HTML' }
-    );
-});
-
-console.log('🤖 Бот запущен...');
+console.log('🤖 Бот запускается...');
